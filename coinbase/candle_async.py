@@ -1,3 +1,4 @@
+from asyncio.locks import Semaphore
 from asyncio.tasks import sleep
 import logging
 import time
@@ -8,14 +9,6 @@ import asyncio
 import httpx
 from .auth import CoinbaseAuth
 
-class RateLimiter(asyncio.Semaphore):
-    def release(self):
-        time.sleep(1)
-        t0 = time.perf_counter()
-        super().release()
-        t1 = time.perf_counter()
-        logging.info(f"Released after {t1-t0:0.4f} seconds")
-        
 class TimeIt:
     def __init__(self) -> None:
         self.t = time.perf_counter()
@@ -85,7 +78,7 @@ class Coin:
         end: Optional[datetime] = None,
     ):
         interval_per_request = timedelta(seconds=(300 * resolution))
-        self.limiter = RateLimiter(9)
+        self.limiter = Semaphore(10)
 
         if end is None:
             end = datetime.now()
@@ -101,7 +94,6 @@ class Coin:
             backwards=True,
         )
         async with self.client(params={"granularity": resolution}) as client:
-            self.stopwatch = TimeIt()
             req_batches = [
                 client.build_request(
                     method="GET",
@@ -113,9 +105,7 @@ class Coin:
                 )
                 for batch_end, batch_start in batches
             ]
-            self.stopwatch.stop()
             tasks = [self.make_request(client, req) for req in req_batches]
-            self.stopwatch.stop()
             results = await asyncio.gather(*tasks)
         return results
 
@@ -124,7 +114,7 @@ class Coin:
     ) -> httpx.Response:
         async with self.limiter:
             logging.info("Making Request")
-            self.stopwatch.stop()
             resp = await client.send(req)
             resp.raise_for_status()
+            await asyncio.sleep(1)
             return resp
