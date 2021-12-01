@@ -1,24 +1,30 @@
 import logging
-from typing import Optional, List, Tuple
-import math
-from datetime import date, datetime, timedelta
-import asyncio
-import functools
+from os import makedirs
+from typing import Optional, List, Tuple, Generator
+from datetime import datetime, timedelta
 import httpx
 from .auth import CoinbaseAuth
 
 
+""" class RateLimiter(asyncio.Semaphore):
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.sleep(1)
+        self.release()
+ """
+
+
 def datetime_floor(x: datetime):
+    """Rounds down the datetime to the current minute"""
     return x - timedelta(seconds=x.second, microseconds=x.microsecond)
 
 
-def generate_interval(
+def gen_interval(
     start: datetime,
     end: datetime,
     interval: timedelta,
     offset: timedelta = timedelta(seconds=0),
     backwards: bool = False,
-) -> Tuple[datetime, datetime]:
+) -> Generator[Tuple[datetime, datetime], None, None]:
     """Generates batches of datetime intervals between 2 dates with a given timedelta,
     and checks start dates are less than end dates.  The offset is used to offset the
     next inteval start date from the last interval end date. Intervals can go back from
@@ -52,44 +58,55 @@ def generate_interval(
             yield interval_start, end
 
 
-def candle(
-    coin_id: str,
-    resolution: int = 60,
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
-) -> List[dict]:
+class Coin:
+    def __init__(self, coin_id: str) -> None:
+        self.auth = CoinbaseAuth()
+        self.base_url = f"https://api.exchange.coinbase.com/products/{coin_id}"
+        # limiter = RateLimiter(15)
 
-    auth = CoinbaseAuth()
-    base_url = "https://api.exchange.coinbase.com/products"
-    interval_per_request = timedelta(seconds=(300 * resolution))
+    def client(self, params: Optional[dict] = None) -> httpx.Client:
+        return httpx.Client(base_url=self.base_url, auth=self.auth, params=params)
 
-    if end is None:
-        end = datetime.now()
+    def history(
+        self,
+        resolution: int = 60,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ):
+        interval_per_request = timedelta(seconds=(300 * resolution))
 
-    if start is None:
-        start = end - interval_per_request
+        if end is None:
+            end = datetime.now()
+        if start is None:
+            start = end - interval_per_request
+        start = datetime_floor(start)
+        end = datetime_floor(end)
+        batches = gen_interval(
+            start=start,
+            end=end,
+            interval=interval_per_request,
+            offset=timedelta(seconds=resolution),
+            backwards=True,
+        )
+        with self.client(params={"granularity": resolution}) as client:
+            req_batches = [
+                client.build_request(
+                    method="GET",
+                    url="/candles",
+                    params={
+                        "start": batch_start.isoformat(),
+                        "end": batch_end.isoformat(),
+                    },
+                )
+                for batch_end, batch_start in batches
+            ]
+            results = [self.make_request(client, req) for req in req_batches]
+        return results
 
-    start = datetime_floor(start)
-    end = datetime_floor(end)
-
-    batches = generate_interval(
-        start=start,
-        end=end,
-        interval=interval_per_request,
-        offset=timedelta(seconds=60),
-        backwards=True,
-    )
-    resutls = list()
-    with httpx.Client(base_url=base_url, auth=auth) as client:
-        for batch_end, batch_start in batches:
-            resp = client.get(
-                url=f"/{coin_id}/candles",
-                params={
-                    "granularity": resolution,
-                    "start": batch_start.isoformat(),
-                    "end": batch_end.isoformat(),
-                },
-            )
-            resp.raise_for_status()
-            resutls.append(resp)
-    return resutls
+    def make_request(
+        self, client: httpx.AsyncClient, req: httpx.Request
+    ) -> httpx.Response:
+        # async with self.limiter:
+        resp = client.send(req)
+        resp.raise_for_status()
+        return resp

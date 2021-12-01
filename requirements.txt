@@ -1,1 +1,3 @@
+httpx
+pythonpydantic[dotenv]
 psycopg[binary]

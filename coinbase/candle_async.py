@@ -1,20 +1,28 @@
 from asyncio.tasks import sleep
 import logging
-from os import makedirs
-import re
+import time
 from typing import Optional, List, Tuple, Generator
 import math
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 import asyncio
-import functools
 import httpx
 from .auth import CoinbaseAuth
 
-
 class RateLimiter(asyncio.Semaphore):
-    async def __aexit__(self, exc_type, exc, tb):
-        await asyncio.sleep(1)
-        self.release()
+    def release(self):
+        time.sleep(1)
+        t0 = time.perf_counter()
+        super().release()
+        t1 = time.perf_counter()
+        logging.info(f"Released after {t1-t0:0.4f} seconds")
+        
+class TimeIt:
+    def __init__(self) -> None:
+        self.t = time.perf_counter()
+    def stop(self):
+        t1 = time.perf_counter()
+        logging.info(f"Time {t1-self.t:0.4f} seconds")
+        self.t = t1
 
 
 def datetime_floor(x: datetime):
@@ -28,7 +36,7 @@ def gen_interval(
     interval: timedelta,
     offset: timedelta = timedelta(seconds=0),
     backwards: bool = False,
-) -> Generator[Tuple[datetime, datetime]]:
+) -> Generator[Tuple[datetime, datetime], None, None]:
     """Generates batches of datetime intervals between 2 dates with a given timedelta,
     and checks start dates are less than end dates.  The offset is used to offset the
     next inteval start date from the last interval end date. Intervals can go back from
@@ -62,18 +70,10 @@ def gen_interval(
             yield interval_start, end
 
 
-async def download(client: httpx.AsyncClient, req: httpx.Request, limiter: RateLimiter):
-    async with limiter:
-        resp = await client.send(req)
-        resp.raise_for_status()
-        return resp
-
-
 class Coin:
     def __init__(self, coin_id: str) -> None:
-        auth = CoinbaseAuth()
-        base_url = f"https://api.exchange.coinbase.com/products/{coin_id}"
-        limiter = RateLimiter(15)
+        self.auth = CoinbaseAuth()
+        self.base_url = f"https://api.exchange.coinbase.com/products/{coin_id}"
 
     def client(self, params: Optional[dict] = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self.base_url, auth=self.auth, params=params)
@@ -85,6 +85,7 @@ class Coin:
         end: Optional[datetime] = None,
     ):
         interval_per_request = timedelta(seconds=(300 * resolution))
+        self.limiter = RateLimiter(9)
 
         if end is None:
             end = datetime.now()
@@ -100,6 +101,7 @@ class Coin:
             backwards=True,
         )
         async with self.client(params={"granularity": resolution}) as client:
+            self.stopwatch = TimeIt()
             req_batches = [
                 client.build_request(
                     method="GET",
@@ -111,14 +113,18 @@ class Coin:
                 )
                 for batch_end, batch_start in batches
             ]
+            self.stopwatch.stop()
             tasks = [self.make_request(client, req) for req in req_batches]
-            resutls = await asyncio.gather(tasks)
-        return resutls
+            self.stopwatch.stop()
+            results = await asyncio.gather(*tasks)
+        return results
 
     async def make_request(
         self, client: httpx.AsyncClient, req: httpx.Request
     ) -> httpx.Response:
         async with self.limiter:
+            logging.info("Making Request")
+            self.stopwatch.stop()
             resp = await client.send(req)
             resp.raise_for_status()
             return resp
