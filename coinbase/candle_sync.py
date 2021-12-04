@@ -3,65 +3,19 @@ from os import makedirs
 from typing import Optional, List, Tuple, Generator
 from datetime import datetime, timedelta
 import httpx
+import psycopg
 from .auth import CoinbaseAuth
-
-
-""" class RateLimiter(asyncio.Semaphore):
-    async def __aexit__(self, exc_type, exc, tb):
-        await asyncio.sleep(1)
-        self.release()
- """
-
-
-def datetime_floor(x: datetime):
-    """Rounds down the datetime to the current minute"""
-    return x - timedelta(seconds=x.second, microseconds=x.microsecond)
-
-
-def gen_interval(
-    start: datetime,
-    end: datetime,
-    interval: timedelta,
-    offset: timedelta = timedelta(seconds=0),
-    backwards: bool = False,
-) -> Generator[Tuple[datetime, datetime], None, None]:
-    """Generates batches of datetime intervals between 2 dates with a given timedelta,
-    and checks start dates are less than end dates.  The offset is used to offset the
-    next inteval start date from the last interval end date. Intervals can go back from
-    the end by setting backward to true, but the tuple will be such that the first tuple
-    value will be greater than the second tuple value.  The final interval will be fixed
-    to the final date, so it could represent a smaller interval.
-    """
-    c = 1
-    if start > end:
-        raise ValueError("Start datetime has to be before the Date datetime")
-
-    if backwards:
-        # swap the end and start dates
-        end, start = start, end
-        # correct the interval and offset to go backward
-        interval = -interval
-        offset = -offset
-        # correct the while condition
-        c = -c
-
-    # correct offset for the first interval
-    interval_end = start - offset
-    cond = ((end - interval_end).total_seconds() * c) > 0
-    while cond:
-        interval_start = interval_end + offset
-        interval_end = interval_start + interval
-        cond = ((end - interval_end).total_seconds() * c) > 0
-        if cond:
-            yield interval_start, interval_end
-        else:
-            yield interval_start, end
+import utils
+from db.models import CoinHistory
+from db.settings import Settings
 
 
 class Coin:
     def __init__(self, coin_id: str) -> None:
         self.auth = CoinbaseAuth()
-        self.base_url = f"https://api.exchange.coinbase.com/products/{coin_id}"
+        self.coin_id = coin_id
+        self.base_url = f"https://api.exchange.coinbase.com/products/{self.coin_id}"
+        self.db_settings = Settings()
         # limiter = RateLimiter(15)
 
     def client(self, params: Optional[dict] = None) -> httpx.Client:
@@ -79,16 +33,18 @@ class Coin:
             end = datetime.now()
         if start is None:
             start = end - interval_per_request
-        start = datetime_floor(start)
-        end = datetime_floor(end)
-        batches = gen_interval(
+        start = utils.datetime_floor(start)
+        end = utils.datetime_floor(end)
+        batches = utils.gen_interval(
             start=start,
             end=end,
             interval=interval_per_request,
             offset=timedelta(seconds=resolution),
             backwards=True,
         )
-        with self.client(params={"granularity": resolution}) as client:
+        with self.client(params={"granularity": resolution}) as client, psycopg.connect(
+            self.db_settings.conn_str
+        ) as conn:
             req_batches = [
                 client.build_request(
                     method="GET",
@@ -100,7 +56,10 @@ class Coin:
                 )
                 for batch_end, batch_start in batches
             ]
-            results = [self.make_request(client, req) for req in req_batches]
+            results = [
+                self.write_to_table(self.make_request(client, req), conn)
+                for req in req_batches
+            ]
         return results
 
     def make_request(
@@ -110,3 +69,11 @@ class Coin:
         resp = client.send(req)
         resp.raise_for_status()
         return resp
+
+    def write_to_table(self, resp, conn):
+        with conn.cursor() as cur:
+            coin_history = CoinHistory.from_coinbase(resp.text)
+            cur.executemany(
+                CoinHistory.insert_str(self.coin_id), [row.as_tuple() for row in coin_history]
+            )
+        conn.commit()

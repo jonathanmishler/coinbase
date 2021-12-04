@@ -1,5 +1,6 @@
 from pydantic import BaseSettings, Field
 
+
 class Settings(BaseSettings):
     """Gets the Coinbase authentication settings from the local env variables or .env file"""
 
@@ -12,6 +13,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        secrets_dir = "./secrets"
 
     @property
     def conn_str(self):
